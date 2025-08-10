@@ -16,11 +16,11 @@ def load_model_pair(config):
     draft = AutoModelForCausalLM.from_pretrained(
         **config["draft"]["params"],
         quantization_config=bnb_config if config["draft"]["quantized"] else None
-    ).eval()
+    )
 
     target = AutoModelForCausalLM.from_pretrained(
         **config["target"]["params"],
         quantization_config=bnb_config if config["target"]["quantized"] else None
-    ).eval()
+    )
 
     return draft, target, tokenizer
