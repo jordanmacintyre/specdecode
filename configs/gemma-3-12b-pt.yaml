@@ -5,22 +5,17 @@ draft:
     pretrained_model_name_or_path: "google/gemma-3-1b-pt"
     device_map: "cuda:0"
     torch_dtype: "auto"
-    max_memory:
-      0:"7GiB"
-      1:"7GiB"
+
 target: 
   quantized: false
   params:
     pretrained_model_name_or_path: "google/gemma-3-12b-pt"
     device_map: "cpu"
     torch_dtype: "auto"
-    max_memory:
-      0:"5GiB"
-      1:"7GiB"
     
 # Generation Configs
-prompt: "Once upon a time"
-max_length: 32
-max_new_tokens: 16
-k: 4
+prompt: "Q: Where is the largets city in the world? A:"
+max_length: 64
+max_new_tokens: 32
+k: 2
 summary_file_name: "gemma-3-d1b-t12b-pt" 

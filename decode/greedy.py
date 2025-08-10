@@ -1,7 +1,7 @@
 import torch
 from transformers.cache_utils import DynamicCache
 
-from utils.timing import timed_section
+# from utils.timing import timed_section
 
 SEQ_DIM = -2  # Dimension for token sequence - kv cache shape: (B, H, S, D)
 
@@ -52,120 +52,85 @@ def greedy(config, draft, target, tokenizer, metrics):
     t_cache = None
     k = int(config["k"])
     max_new = int(config["max_new_tokens"])
-    num_tokens = 0
 
     # Create two fixed-size buffers, one per device
-    base = tokenizer(
-        config["prompt"],
-        padding="max_length",
-        max_length=config["max_length"],
-        return_tensors="pt",
-    )
+    base = tokenizer(config["prompt"], padding=False, return_tensors="pt")
+    input_ids = base["input_ids"]
+    attention_mask = base["attention_mask"]
 
-    # Warm up both models on the full prompt ONCE to seed KV
-    prompt_ids = base["input_ids"].to(t_device)
-    with torch.inference_mode(), timed_section(
-        report_fn=metrics.record_target_warmup_time
-    ):
-        t_out = target(input_ids=prompt_ids, use_cache=True)
+    with torch.inference_mode():
+        t_out = target(
+            input_ids=input_ids.to(t_device),
+            attention_mask=attention_mask.to(t_device),
+            use_cache=True,
+        )
         t_cache = t_out.past_key_values
 
-    prompt_ids_d = base["input_ids"].to(d_device)
-    with torch.inference_mode(), timed_section(
-        report_fn=metrics.record_draft_warmup_time
-    ):
-        d_out = draft(input_ids=prompt_ids_d, use_cache=True)
+        d_out = draft(
+            input_ids=input_ids.to(d_device),
+            attention_mask=attention_mask.to(d_device),
+            use_cache=True,
+        )
         d_cache = d_out.past_key_values
 
-    # last committed token ids on each device (1×1 tensors)
     t_tok_last = t_out.logits[:, -1, :].argmax(dim=-1).view(1, 1)
     d_tok_last = t_tok_last.to(d_device)
+    # First token comes from the target warmup step
+    produced = [t_tok_last]
+    num_tokens = 1
+    metrics.add_tokens(total=1, accepted=0, calls=0)
 
-    # Track generated tokens for correct decode at the end
-    produced = []
-    produced.append(t_tok_last.item())
-    num_tokens += 1
-    metrics.add_tokens(total=1)
-
-    # Run until model is reached max number of tokens
     with torch.inference_mode():
         while num_tokens < max_new:
+            # --- Draft proposses k tokens ---
             new_tokens = torch.empty(k, dtype=torch.long, device=d_device)
-
-            # Step 1: Generate draft output sequence of length k
-            with timed_section(report_fn=metrics.record_draft_time):
-                d_tok_in = d_tok_last
-                for i in range(k):
-                    d_out = draft(
-                        input_ids=d_tok_in, past_key_values=d_cache, use_cache=True
-                    )
-                    d_cache = d_out.past_key_values
-                    token = d_out.logits[:, -1, :].argmax(dim=-1)
-                    new_tokens[i] = token.item()
-                    d_tok_in = token.view(1, 1)
-                # keep consistent with buffer tail
-                d_tok_last = d_tok_in
-
-            # Step 2: Process draft output
-            with timed_section(report_fn=metrics.record_target_time):
-                proposed_tokens = new_tokens.to(t_device).view(1, k)  # [1, K]
-                tok_to_verify = torch.cat(
-                    [t_tok_last, proposed_tokens], dim=1
-                )  # [1, K+1]
-                t_out = target(
-                    input_ids=tok_to_verify, past_key_values=t_cache, use_cache=True
+            d_tok_in = d_tok_last
+            for i in range(k):
+                d_out = draft(
+                    input_ids=d_tok_in, past_key_values=d_cache, use_cache=True
                 )
+                d_cache = d_out.past_key_values
+                token = d_out.logits[:, -1, :].argmax(dim=-1)
+                new_tokens[i] = token.item()
+                d_tok_in = token.view(1, 1)
+            d_tok_last = d_tok_in  # last proposed token
 
-            # Step 3) Full verification
-            # KV includes K+1 consumed positions
+            # --- Target verifies proposals from draft ---
+            proposed_tokens = new_tokens.to(t_device).view(1, k)
+            tok_to_verify = torch.cat([t_tok_last, proposed_tokens], dim=1)  # [1, K+1]
+            t_out = target(
+                input_ids=tok_to_verify, past_key_values=t_cache, use_cache=True
+            )
             t_kv_full = t_out.past_key_values
-            # target predictions for each of the K+1 positions
-            t_pred_tokens = t_out.logits.argmax(dim=-1)  # [1, K+1] -> ints
+            t_pred = t_out.logits.argmax(dim=-1)  # [1, K+1]
 
-            # First K predictions correspond to the K proposed tokens
-            # proposed_on_t = proposed_tokens[0]  # [K]
-            # preds_for_k = t_pred_tokens[0, :k]  # [K]
-            matches = proposed_tokens[0] == t_pred_tokens[0, :k]
+            # --- Acceptance (length m) ---
+            matches = proposed_tokens[0] == t_pred[0, :k]
             num_accepted = int(matches.cumprod(dim=0).sum().item())
             num_rejected = k - num_accepted
-            full_accept = num_accepted == k
 
-            # Step 4) Commit via KV-slicing
-            if full_accept:
-                t_cache = trim_cache(t_kv_full, 1)
-                produced.extend(new_tokens.tolist())
+            # --- Update caches (always use carry) ---
+            t_cache = trim_cache(t_kv_full, num_rejected)
+            d_cache = trim_cache(d_cache, num_rejected)
 
-                # Update last committed token on target to the last accepted draft token
-                t_tok_last = proposed_tokens[:, -1:]  # last of proposed
-                d_tok_last = proposed_tokens[:, -1:].to(d_device)  # last of proposed
-            else:
-                # Ingest exactly ONE target token (already computed):
-                # The (K+1)-th prediction is the next token after the K proposals.
-                ingest_tok = int(t_pred_tokens[0, num_accepted].item())
+            # --- Build output and set carry token ---
+            if num_accepted > 0:
+                produced.append(t_pred[:, :num_accepted])  # [1, m]
+            carry_token = t_pred[0, num_accepted].view(1, 1)
+            produced.append(carry_token)
 
-                # Commit target KV to depth (m + 1) after last_tok:
-                # verify_kv_full has K+1 steps; keep (m+1) trim (K+1 - (m+1)) = K - m
-                t_cache = trim_cache(t_kv_full, num_rejected)
+            # --- Set carry token as next-to-be-ingested for both models ---
+            t_tok_last = carry_token.to(t_device)
+            d_tok_last = carry_token.to(d_device)
 
-                # Bookkeeping for produced tokens
-                if num_accepted > 0:
-                    produced.extend(new_tokens[:num_accepted].tolist())
-
-                # Realign DRAFT KV:
-                # Drop unaccepted speculative steps (K - m)
-                d_cache = trim_cache(d_cache, num_rejected - 1)
-
-                # Update target last token to ingested
-                t_tok_last = torch.tensor([[ingest_tok]], device=t_device)
-                d_tok_last = torch.tensor([[ingest_tok]], device=d_device)
-
-                produced.append(ingest_tok)
-
+            # --- Update token tracker and metrics ---
             num_tokens += num_accepted + 1
-            metrics.add_tokens(total=num_accepted + 1, accepted=num_accepted)
+            metrics.add_tokens(total=num_accepted + 1, accepted=num_accepted, calls=1)
 
-            if num_tokens >= max_new:
+            # --- Stop conditions, regular and early (EOS) ---
+            if carry_token.item() == tokenizer.eos_token_id or num_tokens >= max_new:
                 break
 
-    # Decode generated tokens
-    return produced
+    # Decode
+    out_ids = torch.cat(produced, dim=-1).squeeze(0)
+    return out_ids

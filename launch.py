@@ -48,13 +48,14 @@ def main():
     # Update dtype for draft model
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     config["draft"]["params"]["torch_dtype"] = dtype
+    config["target"]["params"]["torch_dtype"] = dtype
 
     # Load models and tokenizer
     draft, target, tokenizer = load_model_pair(config)
 
     # Flash attention
     draft.config._attn_implementation = "sdpa"
-    target.config._attn_implementation = "sdpa"
+    # target.config._attn_implementation = "sdpa"
 
     # Initialize decode metrics
     metrics = DecodeMetrics(config=config)
@@ -69,20 +70,15 @@ def main():
         target_device = next(target.parameters()).device
 
         # Prepare a single tokenized prompt on CPU, then copy once per device
-        base_inputs = tokenizer(
-            config["prompt"],
-            padding="max_length",
-            max_length=config["max_length"],
-            return_tensors="pt",
-        )
-        inputs_t = {
-            k: v.to(target_device, non_blocking=True) for k, v in base_inputs.items()
-        }
+        base = tokenizer(config["prompt"], padding=False, return_tensors="pt")
+        input_ids = base["input_ids"]
+        attention_mask = base["attention_mask"]
 
         target.eval()
 
         out_b = target.generate(
-            **inputs_t,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             max_new_tokens=config["max_new_tokens"],
             do_sample=False,
             use_cache=True,
