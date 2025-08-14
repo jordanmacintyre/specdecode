@@ -9,10 +9,6 @@ def load_model_pair(config):
         bnb_4bit_use_double_quant=True,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        (config["draft"]["params"]["pretrained_model_name_or_path"]), use_fast=True
-    )
-
     draft = AutoModelForCausalLM.from_pretrained(
         **config["draft"]["params"],
         quantization_config=bnb_config if config["draft"]["quantized"] else None
@@ -21,6 +17,11 @@ def load_model_pair(config):
     target = AutoModelForCausalLM.from_pretrained(
         **config["target"]["params"],
         quantization_config=bnb_config if config["target"]["quantized"] else None
+    )
+
+    # Use target model tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        (config["target"]["params"]["pretrained_model_name_or_path"])
     )
 
     return draft, target, tokenizer

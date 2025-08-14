@@ -3,11 +3,13 @@ import time
 
 import torch
 import yaml
+from transformers import GenerationConfig
 from transformers.utils import logging
 
 from decode.greedy import greedy
 from eval.metrics import DecodeMetrics
-from models.loader import load_model_pair
+from utils.model_loader import load_model_pair
+from utils.prompts import build_prompt_inputs
 from utils.timing import timed_section
 
 if torch.cuda.is_available():
@@ -66,19 +68,36 @@ def main():
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # Resolve devices (draft/target may differ)
         target_device = next(target.parameters()).device
-
-        # Prepare a single tokenized prompt on CPU, then copy once per device
-        base = tokenizer(config["prompt"], padding=False, return_tensors="pt")
+        base = build_prompt_inputs(
+            tokenizer, config["prompt"], add_generation_prompt=True
+        )
         input_ids = base["input_ids"]
         attention_mask = base["attention_mask"]
 
         target.eval()
 
+        gc = GenerationConfig(
+            do_sample=False,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=0,
+            typical_p=1.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+            num_beams=1,
+            renormalize_logits=False,
+            remove_invalid_values=False,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            forced_eos_token_id=None,
+            forced_bos_token_id=None,
+        )
+
         out_b = target.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            input_ids=input_ids.to(target_device),
+            generation_config=gc,
+            attention_mask=attention_mask.to(target_device),
             max_new_tokens=config["max_new_tokens"],
             do_sample=False,
             use_cache=True,
@@ -103,7 +122,7 @@ def main():
             draft=draft,
             target=target,
             tokenizer=tokenizer,
-            metrics=metrics,
+            # metrics=metrics,
         )
         synchronize_if_cuda(target_device)
 

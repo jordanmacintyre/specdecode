@@ -2,21 +2,21 @@
 draft:
   quantized: false
   params:
-    pretrained_model_name_or_path: "google/gemma-3-1b-pt"
+    pretrained_model_name_or_path: "models/google__gemma-3-1b-it"
     device_map: "cuda:0"
     torch_dtype: "auto"
 
 target: 
   quantized: false
   params:
-    pretrained_model_name_or_path: "google/gemma-3-12b-pt"
+    pretrained_model_name_or_path: "models/google__gemma-3-12b-it"
     device_map: "cpu"
     torch_dtype: "auto"
     
 # Generation Configs
 model_collection: "gemma-3"
-prompt: "Once upon a time"
+prompt: "Tell me a story"
 max_length: 128
 max_new_tokens: 32
 k: 2
-summary_file_name: "gemma-3-d1b-t12b-pt" 
+summary_file_name: "gemma-3-d1b-t12b-it" 

@@ -1,7 +1,7 @@
 import torch
 from transformers.cache_utils import DynamicCache
 
-# from utils.timing import timed_section
+from utils.prompts import build_prompt_inputs
 
 SEQ_DIM = -2  # Dimension for token sequence - kv cache shape: (B, H, S, D)
 
@@ -29,11 +29,7 @@ def trim_cache(cache, num_trim):
     return DynamicCache.from_legacy_cache(tuple(trimmed))
 
 
-def to_device_batch(batch, device):
-    return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-
-
-def greedy(config, draft, target, tokenizer, metrics):
+def greedy(config, draft, target, tokenizer):
     """
     Speculative decoding (greedy verify) with k proposals, fixed-size input buffer.
     """
@@ -42,94 +38,117 @@ def greedy(config, draft, target, tokenizer, metrics):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    d_device = next(draft.parameters()).device
-    t_device = next(target.parameters()).device
+    device_d = next(draft.parameters()).device
+    device_t = next(target.parameters()).device
 
     draft.eval()
     target.eval()
 
-    d_cache = None
-    t_cache = None
+    cache_d = None
+    cache_t = None
     k = int(config["k"])
     max_new = int(config["max_new_tokens"])
 
-    # Create two fixed-size buffers, one per device
-    base = tokenizer(config["prompt"], padding=False, return_tensors="pt")
+    # Tokenize prompt
+    base = build_prompt_inputs(tokenizer, config["prompt"], add_generation_prompt=True)
     input_ids = base["input_ids"]
     attention_mask = base["attention_mask"]
 
+    # Warmup models with intial input sequence to build cache
     with torch.inference_mode():
-        t_out = target(
-            input_ids=input_ids.to(t_device),
-            attention_mask=attention_mask.to(t_device),
+        out_t = target(
+            input_ids=input_ids.to(device_t),
+            attention_mask=attention_mask.to(device_t),
             use_cache=True,
         )
-        t_cache = t_out.past_key_values
+        cache_t = out_t.past_key_values
 
-        d_out = draft(
-            input_ids=input_ids.to(d_device),
-            attention_mask=attention_mask.to(d_device),
+        out_d = draft(
+            input_ids=input_ids.to(device_d),
+            attention_mask=attention_mask.to(device_d),
             use_cache=True,
         )
-        d_cache = d_out.past_key_values
+        cache_d = out_d.past_key_values
 
-    t_tok_last = t_out.logits[:, -1, :].argmax(dim=-1).view(1, 1)
-    d_tok_last = t_tok_last.to(d_device)
+    last_tok_t = out_t.logits[:, -1, :].argmax(dim=-1).view(1, 1)
+    last_tok_d = last_tok_t.to(device_d)
+
     # First token comes from the target warmup step
-    produced = [t_tok_last]
+    produced = [last_tok_t]
     num_tokens = 1
-    metrics.add_tokens(total=1, accepted=0, calls=0)
 
     with torch.inference_mode():
+        # Reuse this buffer each iteration to avoid re-alloc
+        new_tokens = torch.empty((1, k), dtype=torch.long, device=device_d)
+
         while num_tokens < max_new:
-            # --- Draft proposses k tokens ---
-            new_tokens = torch.empty(k, dtype=torch.long, device=d_device)
-            d_tok_in = d_tok_last
+            # Draft proposes K tokens
+            in_tok_d = last_tok_d
             for i in range(k):
-                d_out = draft(
-                    input_ids=d_tok_in, past_key_values=d_cache, use_cache=True
+                out_d = draft(
+                    input_ids=in_tok_d, past_key_values=cache_d, use_cache=True
                 )
-                d_cache = d_out.past_key_values
-                token = d_out.logits[:, -1, :].argmax(dim=-1)
-                new_tokens[i] = token.item()
-                d_tok_in = token.view(1, 1)
-            d_tok_last = d_tok_in  # last proposed token
+                cache_d = out_d.past_key_values
+                in_tok_d = out_d.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                new_tokens[0, i] = in_tok_d[0, 0]
+            last_tok_d = in_tok_d  # last proposed
 
-            # --- Target verifies proposals from draft ---
-            proposed_tokens = new_tokens.to(t_device).view(1, k)
-            tok_to_verify = torch.cat([t_tok_last, proposed_tokens], dim=1)  # [1, K+1]
-            t_out = target(
-                input_ids=tok_to_verify, past_key_values=t_cache, use_cache=True
+            # Target verifies [last + proposals]
+            proposed_tokens = new_tokens.to(device_t, non_blocking=False, copy=True)
+            tok_to_verify = torch.cat((last_tok_t, proposed_tokens), dim=1)  # [1, K+1]
+            out_t = target(
+                input_ids=tok_to_verify, past_key_values=cache_t, use_cache=True
             )
-            t_kv_full = t_out.past_key_values
-            t_pred = t_out.logits.argmax(dim=-1)  # [1, K+1]
+            kv_full_t = out_t.past_key_values
+            pred_t = out_t.logits.argmax(dim=-1)  # [1, K+1]
 
-            # --- Acceptance (length m) ---
-            matches = proposed_tokens[0] == t_pred[0, :k]
-            num_accepted = int(matches.cumprod(dim=0).sum().item())
+            # Acceptance prefix
+            matches = proposed_tokens[0] == pred_t[0, :k]  # [K], bool
+            num_accepted = int(matches.cumprod(0).sum().item())
             num_rejected = k - num_accepted
 
-            # --- Update caches (always use carry) ---
-            t_cache = trim_cache(t_kv_full, num_rejected)
-            d_cache = trim_cache(d_cache, num_rejected)
+            # Commit caches (always-carry)
+            # Keep exactly (m + 1) verified positions; drop the remaining tokens
+            cache_t = trim_cache(kv_full_t, num_rejected)
+            cache_d = trim_cache(cache_d, num_rejected)
 
-            # --- Build output and set carry token ---
+            # Append accepted (with in-chunk EOS guard)
             if num_accepted > 0:
-                produced.append(t_pred[:, :num_accepted])  # [1, m]
-            carry_token = t_pred[0, num_accepted].view(1, 1)
-            produced.append(carry_token)
+                acc_chunk = pred_t[:, :num_accepted]  # [1, m]
 
-            # --- Set carry token as next-to-be-ingested for both models ---
-            t_tok_last = carry_token.to(t_device)
-            d_tok_last = carry_token.to(d_device)
+                # Fast EOS test without materializing big masks twice
+                acc_eos_mask = acc_chunk.eq(tokenizer.eos_token_id)  # [1, m], bool
+                if acc_eos_mask.any().item():
+                    # Cut at first EOS, commit, then stop
+                    first_eos_idx = int(
+                        acc_eos_mask.nonzero(as_tuple=True)[1][0].item()
+                    )
+                    slice_len = first_eos_idx + 1
+                    produced.append(acc_chunk[:, :slice_len])
+                    num_tokens += slice_len
+                    break
 
-            # --- Update token tracker and metrics ---
-            num_tokens += num_accepted + 1
-            metrics.add_tokens(total=num_accepted + 1, accepted=num_accepted, calls=1)
+                # No EOS, append all tokens
+                produced.append(acc_chunk)
+                num_tokens += num_accepted
 
-            # --- Stop conditions, regular and early (EOS) ---
-            if carry_token.item() == tokenizer.eos_token_id or num_tokens >= max_new:
+            if num_tokens >= max_new:
                 break
+            else:
+                # Append carry (single token), EOS guard
+                carry_token = pred_t[0, num_accepted].view(1, 1)
+                if carry_token.item() == tokenizer.eos_token_id:
+                    produced.append(carry_token)
+                    num_tokens += 1
+                    break
+
+                # Append carry and advance both models to it if space available
+                produced.append(carry_token)
+                num_tokens += 1
+
+                # Prepare for next set of draft token proposals
+                last_tok_t = carry_token
+                last_tok_d = carry_token.to(device_d, non_blocking=True)
 
     # Decode
     out_ids = torch.cat(produced, dim=-1).squeeze(0)
