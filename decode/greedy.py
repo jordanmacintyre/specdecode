@@ -1,8 +1,6 @@
 import torch
 from transformers.cache_utils import DynamicCache
 
-from utils.prompts import build_prompt_inputs
-
 SEQ_DIM = -2  # Dimension for token sequence - kv cache shape: (B, H, S, D)
 
 
@@ -29,46 +27,37 @@ def trim_cache(cache, num_trim):
     return DynamicCache.from_legacy_cache(tuple(trimmed))
 
 
-def greedy(config, draft, target, tokenizer):
+def greedy(dataloader, draft, target, tok, metrics, config):
     """
     Speculative decoding (greedy verify) with k proposals, fixed-size input buffer.
     """
 
-    # Set pad token if needed
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    device_d = next(draft.parameters()).device
-    device_t = next(target.parameters()).device
-
     draft.eval()
     target.eval()
 
+    device = config["device"]
     cache_d = None
     cache_t = None
     k = int(config["k"])
-    max_new = int(config["max_new_tokens"])
+    max_new_tokens = int(config["max_new_tokens"])
 
-    # Tokenize prompt
-    base = build_prompt_inputs(tokenizer, config["prompt"], add_generation_prompt=True)
-    input_ids = base["input_ids"]
-    attention_mask = base["attention_mask"]
-
-    # Warmup models with intial input sequence to build cache
     with torch.inference_mode():
-        out_t = target(
-            input_ids=input_ids.to(device_t),
-            attention_mask=attention_mask.to(device_t),
-            use_cache=True,
-        )
-        cache_t = out_t.past_key_values
+        for batch in dataloader:
+            num_tokens = torch.zeros((batch.size(0), 1))
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-        out_d = draft(
-            input_ids=input_ids.to(device_d),
-            attention_mask=attention_mask.to(device_d),
-            use_cache=True,
-        )
-        cache_d = out_d.past_key_values
+            for i in range(max_new_tokens):
+                # Generate k draft samples
+                out_d = target.generate(
+                    **batch,
+                    max_new_tokens=config["k"],
+                    pad_token_id=tok.pad_token_id,
+                    do_sample=False,
+                    top_p=None,  # Set despite do_sample=False (removes warnings)
+                    top_k=None,  # Set despite do_sample=False (removes warnings)
+                    use_cache=True,
+                )
+                cache_d = out_d.past_key_values
 
     last_tok_t = out_t.logits[:, -1, :].argmax(dim=-1).view(1, 1)
     last_tok_d = last_tok_t.to(device_d)
@@ -117,7 +106,7 @@ def greedy(config, draft, target, tokenizer):
                 acc_chunk = pred_t[:, :num_accepted]  # [1, m]
 
                 # Fast EOS test without materializing big masks twice
-                acc_eos_mask = acc_chunk.eq(tokenizer.eos_token_id)  # [1, m], bool
+                acc_eos_mask = acc_chunk.eq(tok.eos_token_id)  # [1, m], bool
                 if acc_eos_mask.any().item():
                     # Cut at first EOS, commit, then stop
                     first_eos_idx = int(
@@ -137,7 +126,7 @@ def greedy(config, draft, target, tokenizer):
             else:
                 # Append carry (single token), EOS guard
                 carry_token = pred_t[0, num_accepted].view(1, 1)
-                if carry_token.item() == tokenizer.eos_token_id:
+                if carry_token.item() == tok.eos_token_id:
                     produced.append(carry_token)
                     num_tokens += 1
                     break

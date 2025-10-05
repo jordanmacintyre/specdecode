@@ -3,19 +3,22 @@ import time
 
 import torch
 import yaml
+from datasets import load_dataset
+from torch.utils.data import DataLoader
 from transformers import GenerationConfig
 from transformers.utils import logging
 
 from decode.greedy import greedy
 from eval.metrics import DecodeMetrics
 from utils.model_loader import load_model_pair
-from utils.prompts import build_prompt_inputs
 from utils.timing import timed_section
 
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+
+# TODO: Run a loop to test latency and then throughput
 
 # Transformers logs error-only
 logging.set_verbosity_error()
@@ -37,6 +40,31 @@ def load_config(path: str):
     return cfg
 
 
+def tokenize_function(examples, tok, max_length):
+    prompt_text = [
+        tok.apply_chat_template(
+            [{"role": "user", "content": text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for text in ds["question"]
+    ]
+
+    tokenized_prompt = tok(
+        prompt_text,
+        padding="max_length",
+        max_length=max_length,
+        truncation=True,
+        return_tensors="pt",
+        return_attention_mask=True,
+    )
+
+    return {
+        "input_ids": tokenized_prompt["input_ids"],
+        "attention_mask": tokenized_prompt["attention_mask"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
@@ -47,92 +75,73 @@ def main():
 
     config = load_config(args.config)
 
-    # Update dtype for draft model
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    config["draft"]["params"]["torch_dtype"] = dtype
-    config["target"]["params"]["torch_dtype"] = dtype
-
     # Load models and tokenizer
-    draft, target, tokenizer = load_model_pair(config)
+    draft, target, tok = load_model_pair(config)
 
-    # Flash attention
-    draft.config._attn_implementation = "sdpa"
-    # target.config._attn_implementation = "sdpa"
+    # Set device
+    device = config["device"]
 
     # Initialize decode metrics
     metrics = DecodeMetrics(config=config)
 
-    # Get baseline performance using only target model
-    with torch.inference_mode(), timed_section(report_fn=metrics.set_baseline_time):
-        # Set pad token if needed
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+    # Prepare dataset
+    ds = load_dataset(**config["dataset"], split=f'train[: {config["num_samples"]}]')
 
-        target_device = next(target.parameters()).device
-        base = build_prompt_inputs(
-            tokenizer, config["prompt"], add_generation_prompt=True
-        )
-        input_ids = base["input_ids"]
-        attention_mask = base["attention_mask"]
-
-        target.eval()
-
-        gc = GenerationConfig(
-            do_sample=False,
-            temperature=1.0,
-            top_p=1.0,
-            top_k=0,
-            typical_p=1.0,
-            repetition_penalty=1.0,
-            no_repeat_ngram_size=0,
-            num_beams=1,
-            renormalize_logits=False,
-            remove_invalid_values=False,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            forced_eos_token_id=None,
-            forced_bos_token_id=None,
-        )
-
-        out_b = target.generate(
-            input_ids=input_ids.to(target_device),
-            generation_config=gc,
-            attention_mask=attention_mask.to(target_device),
-            max_new_tokens=config["max_new_tokens"],
-            do_sample=False,
-            use_cache=True,
-        )
-        synchronize_if_cuda(target_device)
-
-    print("################################")
-    print("Baseline Run (Target)")
-    print("Initial prompt:")
-    print(config["prompt"])
-    print("Final prompt:")
-    print(
-        tokenizer.decode(
-            out_b[0, -config["max_new_tokens"] :], skip_special_tokens=True
-        )
+    # Tokenize dataset
+    tokenized_dataset = ds.map(
+        tokenize_function,
+        fn_kwargs={"tok": tok, "max_length": 256},
+        batched=True,
+        remove_columns=ds.column_names,
     )
 
-    # Run greedy speculative decoding
-    with timed_section(report_fn=metrics.record_total_time):
-        out_s = greedy(
-            config=config,
-            draft=draft,
-            target=target,
-            tokenizer=tokenizer,
-            # metrics=metrics,
-        )
-        synchronize_if_cuda(target_device)
+    # Format dataset to return torch tensors on indexing
+    tokenized_dataset = tokenized_dataset.with_format(
+        type="torch",
+        columns=["input_ids", "attention_mask"],
+    )
 
+    # Initialize Dataloader
+    dl = DataLoader(
+        tokenized_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        drop_last=False,
+    )
+
+    # Get baseline performance using only target model
+    print("################################")
+    print("Baseline Run (Target)")
+    print("################################")
+    with torch.inference_mode(), timed_section(report_fn=metrics.set_baseline_time):
+        target.eval()
+        for batch in dl:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            # Generate baseline output
+            out_bl = target.generate(
+                **batch,
+                max_new_tokens=config["max_new_tokens"],
+                pad_token_id=tok.pad_token_id,
+                do_sample=False,
+                top_p=None,  # Set despite do_sample=False (removes warnings)
+                top_k=None,  # Set despite do_sample=False (removes warnings)
+                use_cache=True,
+            )
+
+    # Run greedy speculative decoding
     print("################################")
     print("Speculative Run (Target + Draft)")
-    print("Initial prompt:")
-    print(config["prompt"])
-    print("Final prompt:")
-    print(tokenizer.decode(out_s, skip_special_tokens=True))
     print("################################")
+    with timed_section(report_fn=metrics.record_total_time):
+        # Generate speculative decoding output
+        out_sd = greedy(
+            dataloader=dl,
+            draft=draft,
+            target=target,
+            tok=tok,
+            metrics=metrics,
+            config=config,
+        )
 
     metrics.print_summary()
     # metrics.save_summary()
